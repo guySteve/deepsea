@@ -1,0 +1,20 @@
+{
+  "profile": "rtx4070-ada-safe",
+  "gpuNameContains": "RTX 4070",
+  "gpuIndex": 0,
+  "computeCapability": "8.9",
+  "minimumDriver": "550.0",
+  "minimumCudaToolkit": "12.4",
+  "cudaTarget": "sm_89",
+  "powerLimitWatts": 150,
+  "lockedCoreClockMHz": 2475,
+  "memoryClockOffsetMHz": 0,
+  "vramReserveMiB": 2048,
+  "minerAllocationMiB": 2432,
+  "temperatureLimitC": 85,
+  "region": 8192,
+  "foundBatch": 16,
+  "apiPort": 21550,
+  "requirePowerAndClockTuning": true,
+  "manualClockLockConfirmed": false
+}

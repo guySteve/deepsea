@@ -1,0 +1,26 @@
+diff --git a/pearl_gateway/comm/dataclasses.py b/pearl_gateway/comm/dataclasses.py
+index 4a01f5d..1d6c6ae 100644
+--- a/pearl_gateway/comm/dataclasses.py
++++ b/pearl_gateway/comm/dataclasses.py
+@@ -1,8 +1,11 @@
++from __future__ import annotations
++
+ import base64
+ from dataclasses import dataclass
+-from typing import Any, ClassVar
++from typing import TYPE_CHECKING, Any, ClassVar
+ 
+-import torch
++if TYPE_CHECKING:
++    import torch
+ from bitcoinutils.transactions import Transaction
+ from pearl_gateway.blockchain_utils.blockchain_utils import (
+     bits_to_target,
+@@ -37,5 +40,7 @@ def b64_decode(data: str) -> bytes:
+ 
+ 
+ def decode_dtype(encoded_dtype: str) -> torch.dtype:
++    import torch
++
+     # dtype is serialized as "torch.dtype"
+     return getattr(torch, encoded_dtype.replace("torch.", ""))

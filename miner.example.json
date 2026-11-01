@@ -1,0 +1,10 @@
+{
+  "profile": "miner/rtx4070.json",
+  "mode": "pool",
+  "wallet": "prl1pYOUR_MAINNET_ADDRESS",
+  "worker": "blockhunter",
+  "pool": "pearl-eu2.luckypool.io:3360",
+  "soloGateway": "127.0.0.1:8337",
+  "tls": false,
+  "manualClockLockConfirmed": false
+}

@@ -1,0 +1,1024 @@
+diff --git a/csrc/capi/p40_capi.cu b/csrc/capi/p40_capi.cu
+index 1f322f6..f490af5 100644
+--- a/csrc/capi/p40_capi.cu
++++ b/csrc/capi/p40_capi.cu
+@@ -90,6 +90,21 @@ P40_API int p40_memcpy_dtoh(void* h, const void* d, size_t n) {
+ P40_API int p40_memset(void* d, int v, size_t n) { return (int)cudaMemset(d, v, n); }
+ P40_API int p40_sync(void) { return (int)cudaDeviceSynchronize(); }
+ 
++P40_API int p40_commitment_v3(const void* A_root, const void* B_root,
++                              const void* key, void* nsA, void* nsB,
++                              unsigned M, unsigned N) {
++  int dev = 0;
++  cudaDeviceProp prop;
++  cudaError_t error = cudaGetDevice(&dev);
++  if (error != cudaSuccess) return (int)error;
++  error = cudaGetDeviceProperties(&prop, dev);
++  if (error != cudaSuccess) return (int)error;
++  commitment_hash_from_merkle_roots(
++      (const uint8_t*)A_root, (const uint8_t*)B_root, (const uint8_t*)key,
++      (uint8_t*)nsA, (uint8_t*)nsB, M, N, prop, 0);
++  return (int)cudaDeviceSynchronize();
++}
++
+ // dst[cols,rows] = transpose of the [rows,cols] logical view of src (a column
+ // slice of a row-major matrix with leading dim src_ld, starting at col_off).
+ P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
+@@ -108,39 +123,42 @@ P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
+ 
+ // GPU job setup (mirrors the torch setup_job): Philox-fill A[M,K] and B[K,N],
+ // transpose B->Bt[N,K], tensor_hash A and Bt (keyed by `key`), then derive the
+-// noise seeds. A, B, Bt, key, nsA, nsB are caller-allocated device buffers
+-// (nsA/nsB are 32 bytes). Replaces the ~7s host RNG+commit with ~0.1s on-device.
++// noise seeds. Every device buffer is caller-owned so fresh grids never allocate
++// or free memory on the mining stream.
+ P40_API int p40_setup_job(void* A, void* B, void* Bt, const void* key,
+-                           void* nsA, void* nsB, int M, int N, int K, int R,
++                           void* nsA, void* nsB, void* A_root, void* B_root,
++                           void* scratch, size_t scratch_bytes,
++                           int M, int N, int K, int R,
+                            unsigned long long seed) {
++  const unsigned chunk = 1024u, tpb = 128u;
++  unsigned ncA = ((unsigned)((int64_t)M * K) + chunk - 1) / chunk, nbA = (ncA + tpb - 1) / tpb;
++  unsigned ncB = ((unsigned)((int64_t)N * K) + chunk - 1) / chunk, nbB = (ncB + tpb - 1) / tpb;
++  const size_t required_scratch = (size_t)(nbA > nbB ? nbA : nbB) * 32u;
++  if (!A_root || !B_root || !scratch || scratch_bytes < required_scratch)
++    return (int)cudaErrorInvalidValue;
+   cudaStream_t s = 0;
+   launch_fill_rand_i8((int8_t*)A, (int64_t)M * K, seed, s);
+   launch_fill_rand_i8((int8_t*)B, (int64_t)K * N, seed + 1, s);
+   launch_transpose_i8((const int8_t*)B, (int8_t*)Bt, K, N, s);  // B[K,N] -> Bt[N,K]
+-
+-  const unsigned chunk = 1024u, tpb = 128u;
+-  unsigned ncA = ((unsigned)((int64_t)M * K) + chunk - 1) / chunk, nbA = (ncA + tpb - 1) / tpb;
+-  unsigned ncB = ((unsigned)((int64_t)N * K) + chunk - 1) / chunk, nbB = (ncB + tpb - 1) / tpb;
+-  unsigned scratch_bytes = (nbA > nbB ? nbA : nbB) * 32u;
+-  uint8_t *A_root = nullptr, *B_root = nullptr, *scratch = nullptr;
+-  cudaMalloc((void**)&A_root, 32);
+-  cudaMalloc((void**)&B_root, 32);
+-  cudaMalloc((void**)&scratch, scratch_bytes);
+   int dev = 0;
+-  cudaGetDevice(&dev);
+-  cudaDeviceProp prop;
+-  cudaGetDeviceProperties(&prop, dev);
+-  tensor_hash((const uint8_t*)A, (uint32_t)((int64_t)M * K), A_root,
+-              (const uint8_t*)key, nbA, tpb, 2, 512, scratch, prop, s);
+-  tensor_hash((const uint8_t*)Bt, (uint32_t)((int64_t)N * K), B_root,
+-              (const uint8_t*)key, nbB, tpb, 2, 512, scratch, prop, s);
+-  commitment_hash_from_merkle_roots(A_root, B_root, (const uint8_t*)key,
+-                                     (uint8_t*)nsA, (uint8_t*)nsB, prop, s);
+-  cudaError_t e = cudaGetLastError();
+-  cudaFree(A_root);
+-  cudaFree(B_root);
+-  cudaFree(scratch);
+-  return (int)e;
++  cudaError_t e = cudaGetDevice(&dev);
++  if (e != cudaSuccess) return (int)e;
++  static int s_prop_device = -1;
++  static cudaDeviceProp s_prop;
++  if (s_prop_device != dev) {
++    e = cudaGetDeviceProperties(&s_prop, dev);
++    if (e != cudaSuccess) return (int)e;
++    s_prop_device = dev;
++  }
++  tensor_hash((const uint8_t*)A, (uint32_t)((int64_t)M * K), (uint8_t*)A_root,
++              (const uint8_t*)key, nbA, tpb, 2, 512, (uint8_t*)scratch, s_prop, s);
++  tensor_hash((const uint8_t*)Bt, (uint32_t)((int64_t)N * K), (uint8_t*)B_root,
++              (const uint8_t*)key, nbB, tpb, 2, 512, (uint8_t*)scratch, s_prop, s);
++  commitment_hash_from_merkle_roots((const uint8_t*)A_root, (const uint8_t*)B_root,
++                                     (const uint8_t*)key,
++                                     (uint8_t*)nsA, (uint8_t*)nsB,
++                                     (uint32_t)M, (uint32_t)N, s_prop, s);
++  return (int)cudaGetLastError();
+ }
+ 
+ // Generate the four noise operands. EAR is K-major [R,k], EBL is R-major [k,R]
+diff --git a/csrc/gemm/bindings.cpp b/csrc/gemm/bindings.cpp
+index 3625457..26705ab 100644
+--- a/csrc/gemm/bindings.cpp
++++ b/csrc/gemm/bindings.cpp
+@@ -94,6 +94,7 @@ void tensor_hash(
+ void commitment_hash_from_merkle_roots(
+     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
+     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
++    uint32_t salted_dim_a, uint32_t salted_dim_b,
+     cudaDeviceProp& deviceProp, cudaStream_t stream);
+ 
+ // RNG fill + transpose (definition in rng_fill_sm61.cu, extern "C")
+@@ -486,7 +487,7 @@ std::vector<at::Tensor> setup_job(at::Tensor key,
+       A_root.data_ptr<uint8_t>(), B_root.data_ptr<uint8_t>(),
+       key.data_ptr<uint8_t>(),
+       noise_seed_A.data_ptr<uint8_t>(), noise_seed_B.data_ptr<uint8_t>(),
+-      dprops, stream);
++      static_cast<uint32_t>(M), static_cast<uint32_t>(N), dprops, stream);
+ 
+   return {A, B, noise_seed_A, noise_seed_B};
+ }
+diff --git a/csrc/tensor_hash/commitment_hash_from_merkle_roots_kernel.hpp b/csrc/tensor_hash/commitment_hash_from_merkle_roots_kernel.hpp
+index aa85f64..5ed661f 100644
+--- a/csrc/tensor_hash/commitment_hash_from_merkle_roots_kernel.hpp
++++ b/csrc/tensor_hash/commitment_hash_from_merkle_roots_kernel.hpp
+@@ -2,6 +2,15 @@
+ 
+ namespace pearl {
+ 
++__device__ __constant__ uint32_t
++    SEED_SALT_A_U32[blake3::CHAINING_VALUE_SIZE_U32] = {
++        0x6C404982, 0x1615EDA0, 0x92F61696, 0xF876F0FC,
++        0x2ADBDB92, 0x52B82370, 0x1977D4F0, 0x7B0190C3};
++__device__ __constant__ uint32_t
++    SEED_SALT_B_U32[blake3::CHAINING_VALUE_SIZE_U32] = {
++        0x32063011, 0xCA0163EC, 0x71AFE22B, 0x4F4D3F8B,
++        0x39C6E91A, 0x04CCE888, 0x1D304448, 0xA99AB871};
++
+ class CommitmentHashFromMerkleRootsKernel {
+  public:
+   using Element = uint8_t;
+@@ -21,6 +30,8 @@ class CommitmentHashFromMerkleRootsKernel {
+     Element const* const ptr_key;
+     Element* const ptr_A_commitment_hash;
+     Element* const ptr_B_commitment_hash;
++    uint32_t salted_dim_a;
++    uint32_t salted_dim_b;
+   };
+ 
+   // Kernel entry point API
+@@ -30,11 +41,14 @@ class CommitmentHashFromMerkleRootsKernel {
+     Element const* const ptr_key;
+     Element* const ptr_A_commitment_hash;
+     Element* const ptr_B_commitment_hash;
++    uint32_t salted_dim_a;
++    uint32_t salted_dim_b;
+   };
+ 
+   static Params to_underlying_arguments(Arguments const& args) {
+     return {args.ptr_A_merkle_root, args.ptr_B_merkle_root, args.ptr_key,
+-            args.ptr_A_commitment_hash, args.ptr_B_commitment_hash};
++            args.ptr_A_commitment_hash, args.ptr_B_commitment_hash,
++            args.salted_dim_a, args.salted_dim_b};
+   }
+ 
+   static dim3 get_grid_shape(Params const& params) { return dim3(1); }
+@@ -44,62 +58,80 @@ class CommitmentHashFromMerkleRootsKernel {
+   CUTLASS_DEVICE
+   void operator()(Params const& params, char* smem_buf) {
+ 
+-    // First calculate B commitment hash: BLAKE3(key || B_merkle_root)
+-    Tensor rBlockB = make_tensor<uint32_t>(RmemBlockLayout{});
+-    Tensor rChainingValueB = make_tensor<uint32_t>(RmemChainingValueLayout{});
+-
+-    uint32_t const* key_u32 = (uint32_t const*)params.ptr_key;
++    Tensor rARoot = make_tensor<uint32_t>(RmemChainingValueLayout{});
++    Tensor rBRoot = make_tensor<uint32_t>(RmemChainingValueLayout{});
++    uint32_t const* A_merkle_root_u32 =
++        (uint32_t const*)params.ptr_A_merkle_root;
+     uint32_t const* B_merkle_root_u32 =
+         (uint32_t const*)params.ptr_B_merkle_root;
++    bind_root(A_merkle_root_u32, params.salted_dim_a, SEED_SALT_A_U32,
++              rARoot);
++    bind_root(B_merkle_root_u32, params.salted_dim_b, SEED_SALT_B_U32,
++              rBRoot);
++
++    Tensor rKey = make_tensor<uint32_t>(RmemChainingValueLayout{});
++    load_chaining_value((uint32_t const*)params.ptr_key, rKey);
++    Tensor rChainingValueB = make_tensor<uint32_t>(RmemChainingValueLayout{});
++    hash_pair(rKey, rBRoot, rChainingValueB);
++    Tensor rChainingValueA = make_tensor<uint32_t>(RmemChainingValueLayout{});
++    hash_pair(rChainingValueB, rARoot, rChainingValueA);
++
++    // Copy the result back to global memory
++    uint32_t* A_commitment_hash_u32 = (uint32_t*)params.ptr_A_commitment_hash;
++    uint32_t* B_commitment_hash_u32 = (uint32_t*)params.ptr_B_commitment_hash;
+ 
+     CUTLASS_PRAGMA_UNROLL
+     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
+-      rBlockB(i) = key_u32[i];
+-      rBlockB(i + blake3::CHAINING_VALUE_SIZE_U32) = B_merkle_root_u32[i];
++      A_commitment_hash_u32[i] = rChainingValueA(i);
++      B_commitment_hash_u32[i] = rChainingValueB(i);
+     }
++  }
++
++ private:
++  template <class TensorOut>
++  CUTLASS_DEVICE static void load_chaining_value(uint32_t const* src,
++                                                 TensorOut& out) {
+     CUTLASS_PRAGMA_UNROLL
+     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
+-      rChainingValueB(i) = blake3::IV[i];
++      out(i) = src[i];
+     }
++  }
+ 
+-    // We do one BLAKE3 block as we have exactly blake3::MSG_BLOCK_SIZE data
++  template <class TensorLeft, class TensorRight, class TensorOut>
++  CUTLASS_DEVICE static void hash_pair(TensorLeft const& left,
++                                       TensorRight const& right,
++                                       TensorOut& out) {
++    Tensor rBlock = make_tensor<uint32_t>(RmemBlockLayout{});
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
++      rBlock(i) = left(i);
++      rBlock(i + blake3::CHAINING_VALUE_SIZE_U32) = right(i);
++      out(i) = blake3::IV[i];
++    }
+     static constexpr blake3::CompressParams single_block_params = {
+         .counter = 0,
+         .block_len = blake3::MSG_BLOCK_SIZE,
+         .flags = blake3::CHUNK_START | blake3::CHUNK_END | blake3::ROOT,
+     };
+-    blake3::compress_msg_block_u32(rBlockB, rChainingValueB,
+-                                   single_block_params);
+-
+-    // Now calculate A commitment hash: BLAKE3(B_commitment_hash || A_merkle_root)
+-    Tensor rBlockA = make_tensor<uint32_t>(RmemBlockLayout{});
+-    Tensor rChainingValueA = make_tensor<uint32_t>(RmemChainingValueLayout{});
+-
+-    uint32_t const* A_merkle_root_u32 =
+-        (uint32_t const*)params.ptr_A_merkle_root;
++    blake3::compress_msg_block_u32(rBlock, out, single_block_params);
++  }
+ 
++  template <class TensorOut>
++  CUTLASS_DEVICE static void bind_root(uint32_t const* root, uint32_t dim,
++                                       uint32_t const* salt, TensorOut& out) {
++    Tensor rBlock = make_tensor<uint32_t>(RmemBlockLayout{});
+     CUTLASS_PRAGMA_UNROLL
+-    for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
+-      rBlockA(i) = rChainingValueB(i);  // Use B's result, not the key!
+-      rBlockA(i + blake3::CHAINING_VALUE_SIZE_U32) = A_merkle_root_u32[i];
++    for (int i = 0; i < blake3::MSG_BLOCK_SIZE_U32; ++i) {
++      rBlock(i) = 0;
+     }
+     CUTLASS_PRAGMA_UNROLL
+     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
+-      rChainingValueA(i) = blake3::IV[i];
+-    }
+-
+-    blake3::compress_msg_block_u32(rBlockA, rChainingValueA,
+-                                   single_block_params);
+-
+-    // Copy the result back to global memory
+-    uint32_t* A_commitment_hash_u32 = (uint32_t*)params.ptr_A_commitment_hash;
+-    uint32_t* B_commitment_hash_u32 = (uint32_t*)params.ptr_B_commitment_hash;
+-
+-    CUTLASS_PRAGMA_UNROLL
+-    for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
+-      A_commitment_hash_u32[i] = rChainingValueA(i);
+-      B_commitment_hash_u32[i] = rChainingValueB(i);
++      rBlock(i) = root[i];
++      out(i) = salt[i];
+     }
++    rBlock(Int<blake3::CHAINING_VALUE_SIZE_U32>{}) = dim;
++    blake3::compress_msg_block_u32(
++        rBlock, out, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
+   }
+ };  // class CommitmentHashFromMerkleRootsKernel
+-}  // namespace pearl
+\ No newline at end of file
++}  // namespace pearl
+diff --git a/csrc/tensor_hash/tensor_hash_api.hpp b/csrc/tensor_hash/tensor_hash_api.hpp
+index fd16d9a..446906b 100644
+--- a/csrc/tensor_hash/tensor_hash_api.hpp
++++ b/csrc/tensor_hash/tensor_hash_api.hpp
+@@ -108,7 +108,9 @@ void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
+                                            at::Tensor& B_merkle_root,
+                                            at::Tensor& key,
+                                            at::Tensor& A_commitment_hash,
+-                                           at::Tensor& B_commitment_hash) {
++                                           at::Tensor& B_commitment_hash,
++                                           int64_t salted_dim_a,
++                                           int64_t salted_dim_b) {
+   CHECK_DEVICE(A_merkle_root);
+   CHECK_DEVICE(B_merkle_root);
+   CHECK_DEVICE(key);
+@@ -149,7 +151,9 @@ void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
+   commitment_hash_from_merkle_roots(
+       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
+       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
+-      B_commitment_hash.data_ptr<uint8_t>(), *dprops, stream);
++      B_commitment_hash.data_ptr<uint8_t>(),
++      static_cast<uint32_t>(salted_dim_a),
++      static_cast<uint32_t>(salted_dim_b), *dprops, stream);
+ }
+ 
+ #undef CHECK_DEVICE
+diff --git a/csrc/tensor_hash/tensor_hash_decl.hpp b/csrc/tensor_hash/tensor_hash_decl.hpp
+index 24670a9..b4a06ed 100644
+--- a/csrc/tensor_hash/tensor_hash_decl.hpp
++++ b/csrc/tensor_hash/tensor_hash_decl.hpp
+@@ -20,4 +20,5 @@ void tensor_hash(
+ void commitment_hash_from_merkle_roots(
+     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
+     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
++    uint32_t salted_dim_a, uint32_t salted_dim_b,
+     cudaDeviceProp& deviceProp, cudaStream_t stream);
+diff --git a/csrc/tensor_hash/tensor_hash_host.hpp b/csrc/tensor_hash/tensor_hash_host.hpp
+index 27f5f51..74b2bd6 100644
+--- a/csrc/tensor_hash/tensor_hash_host.hpp
++++ b/csrc/tensor_hash/tensor_hash_host.hpp
+@@ -263,6 +263,7 @@ void tensor_hash(
+ void commitment_hash_from_merkle_roots(
+     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
+     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
++    uint32_t salted_dim_a, uint32_t salted_dim_b,
+     cudaDeviceProp& deviceProp, cudaStream_t stream) {
+ 
+   using CommitmentHashFromMerkleRootsKernel =
+@@ -273,7 +274,9 @@ void commitment_hash_from_merkle_roots(
+       static_cast<const uint8_t*>(B_merkle_root),
+       static_cast<const uint8_t*>(key),
+       static_cast<uint8_t*>(A_commitment_hash),
+-      static_cast<uint8_t*>(B_commitment_hash)};
++      static_cast<uint8_t*>(B_commitment_hash),
++      salted_dim_a,
++      salted_dim_b};
+ 
+   typename CommitmentHashFromMerkleRootsKernel::Params kernel_params =
+       CommitmentHashFromMerkleRootsKernel::to_underlying_arguments(args);
+diff --git a/csrc/tensor_hash/tensor_hash_host_sm61.hpp b/csrc/tensor_hash/tensor_hash_host_sm61.hpp
+index 7b3374c..221e1d9 100644
+--- a/csrc/tensor_hash/tensor_hash_host_sm61.hpp
++++ b/csrc/tensor_hash/tensor_hash_host_sm61.hpp
+@@ -173,10 +173,12 @@ void tensor_hash(const uint8_t* data, uint32_t data_size, uint8_t* out,
+ void commitment_hash_from_merkle_roots(
+     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
+     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
++    uint32_t salted_dim_a, uint32_t salted_dim_b,
+     cudaDeviceProp& /*deviceProp*/, cudaStream_t stream) {
+   using K = pearl::CommitmentHashFromMerkleRootsKernel;
+   typename K::Arguments args{A_merkle_root, B_merkle_root, key,
+-                             A_commitment_hash, B_commitment_hash};
++                             A_commitment_hash, B_commitment_hash,
++                             salted_dim_a, salted_dim_b};
+   typename K::Params p = K::to_underlying_arguments(args);
+   auto k = cutlass::device_kernel<K>;
+   constexpr static int smem = K::SharedStorageSize;
+diff --git a/python/cuda_capi.py b/python/cuda_capi.py
+index 9135e97..a68d390 100644
+--- a/python/cuda_capi.py
++++ b/python/cuda_capi.py
+@@ -48,13 +48,16 @@ _lib.p40_memcpy_htod.argtypes = [_VP, _VP, _Z]
+ _lib.p40_memcpy_dtoh.argtypes = [_VP, _VP, _Z]
+ _lib.p40_memset.argtypes = [_VP, _I, _Z]
+ _lib.p40_sync.argtypes = []
++_lib.p40_commitment_v3.argtypes = [_VP, _VP, _VP, _VP, _VP,
++                                    ctypes.c_uint, ctypes.c_uint]
+ _lib.p40_transpose_i8.argtypes = [_VP, _VP, _I, _I, _I, _I]
+ _lib.p40_noise_gen.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I]
+ _lib.p40_noise_apply_A.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
+ _lib.p40_noise_apply_B.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
+ _lib.p40_noise_gemm.argtypes = [_VP, _VP, _VP, _VP, _I, _I, _I]
+ _lib.p40_pearl_pow_split.argtypes = [_VP, _VP, _I, _I, _I, _I, _VP, _VP, _VP, _VP, _VP, _VP, _I]
+-_lib.p40_setup_job.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I, ctypes.c_ulonglong]
++_lib.p40_setup_job.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _VP, _VP, _VP,
++                               _Z, _I, _I, _I, _I, ctypes.c_ulonglong]
+ _lib.p40_init.argtypes = []
+ _lib.p40_init.restype = _I
+ _lib.p40_device_count.argtypes = []
+@@ -108,13 +111,20 @@ def sync():
+     _chk(_lib.p40_sync(), "sync")
+ 
+ 
++def commitment_v3(A_root, B_root, key, nsA, nsB, M, N):
++    _chk(_lib.p40_commitment_v3(_as(A_root), _as(B_root), _as(key),
++                                _as(nsA), _as(nsB), M, N), "commitment_v3")
++
++
+ def transpose_i8(src, dst, rows, cols, src_ld, col_off):
+     _chk(_lib.p40_transpose_i8(_as(src), _as(dst), rows, cols, src_ld, col_off), "transpose")
+ 
+ 
+-def setup_job(A, B, Bt, key, nsA, nsB, M, N, K, R, seed):
+-    """GPU job setup: fill A,B; commit; write noise seeds nsA,nsB (device)."""
++def setup_job(A, B, Bt, key, nsA, nsB, A_root, B_root, scratch,
++              M, N, K, R, seed):
++    """GPU job setup using caller-owned commitment roots and scratch storage."""
+     _chk(_lib.p40_setup_job(_as(A), _as(B), _as(Bt), _as(key), _as(nsA), _as(nsB),
++                            _as(A_root), _as(B_root), _as(scratch), scratch.nbytes,
+                             M, N, K, R, seed), "setup_job")
+ 
+ 
+diff --git a/python/miner_capi.py b/python/miner_capi.py
+index b917534..f8f594c 100644
+--- a/python/miner_capi.py
++++ b/python/miner_capi.py
+@@ -32,8 +32,10 @@ VARIANT = 1  # pearl_pow_split S=128 4x4 MINB4
+ # the device every region (sync + D2H + pool poll) idled the GPU through the host
+ # round-trip and kept the laptop clock off boost (~28 -> ~20 TH/s). Hits are
+ # astronomically rare at real difficulty, so we give each region its own found/coord
+-# slot and scan the whole batch after a single sync. Tunable via P40_FOUND_BATCH.
+-FOUND_BATCH = max(1, int(os.environ.get("P40_FOUND_BATCH", "64")))
++# slot and scan the whole batch after a single sync. Sixteen regions bounds stale
++# work to roughly 20 ms on Ada while preserving enough queued work for full use.
++# Tunable via P40_FOUND_BATCH for profiling.
++FOUND_BATCH = max(1, int(os.environ.get("P40_FOUND_BATCH", "16")))
+ 
+ # Default pool by GPU class (overridden by --pool). Tensor-core cards (sm_80+) want a
+ # GPU-difficulty pool; Pascal / DP4A cards (sm_61, e.g. the P40) mine fewer hashes so a
+@@ -58,6 +60,11 @@ class Bufs:
+         self.dkeyjob = cc.DBuf(32)       # job key (keys the commitment + proof)
+         self.dnsA = cc.DBuf(32)          # noise_seed_A (== commitment_A, the pow_key)
+         self.dnsB = cc.DBuf(32)          # noise_seed_B
++        self.dA_root = cc.DBuf(32)
++        self.dB_root = cc.DBuf(32)
++        commitment_chunks = (max(M * K, N * K) + 1023) // 1024
++        commitment_blocks = (commitment_chunks + 127) // 128
++        self.dcommit_scratch = cc.DBuf(commitment_blocks * 32)
+         self.dtgt = cc.DBuf(32)
+         self.dApEA = cc.DBuf(RS * K)
+         self.dBt_tmp = cc.DBuf(RS * K)
+@@ -92,11 +99,13 @@ def _proof_worker(proof_q, accepted, log):
+         try:
+             if task is None:
+                 return
+-            pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header, verify = task
++            (pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header,
++             cert_version, verify) = task
+             proof = pearl_host.build_proof_bt(A, Bt, gr, gc, key, noise_rank)
+             if verify:
+                 try:
+-                    v, vmsg = pearl_host.verify_proof_local(header, proof)
++                    v, vmsg = pearl_host.verify_proof_local(
++                        header, proof, cert_version=cert_version)
+                     log(f"  local verify (informational): {v} ({vmsg})")
+                 except Exception as e:
+                     log(f"  local verify error: {e}")
+@@ -107,7 +116,7 @@ def _proof_worker(proof_q, accepted, log):
+             proof_q.task_done()
+ 
+ 
+-def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
++def mine_job(pool, cfg, header, target_int, job_id, cert_version, region, max_regions,
+              sched, bufs, accepted, proof_q, log, verify=False):
+     """Mine a pool job CONTINUOUSLY: the job only fixes the key (from the header)
+     and the target -- the A,B matrices are miner-chosen (random Philox seed). So we
+@@ -116,6 +125,9 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+     job arrives or it is time to switch wallets for the dev fee.
+ 
+     Returns ('NEWJOB', newjob) or ('SWITCH', None)."""
++    if cert_version != 3:
++        raise RuntimeError(
++            f"pool requires certificate version {cert_version}; this build only mines V3")
+     factor = cfg.hash_tile_h * cfg.hash_tile_w * cfg.rounded_common_dim
+     bound = min(target_int * factor, (1 << 256) - 1)
+     log(f"job {job_id} target=2^{target_int.bit_length()-1} "
+@@ -135,7 +147,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+         grid += 1
+         # ---- fresh random grid (new commitment) for this same job ----
+         bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
+-        cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA, bufs.dnsB,
++        cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA,
++                     bufs.dnsB, bufs.dA_root, bufs.dB_root, bufs.dcommit_scratch,
+                      M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
+         cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA, bufs.dnsB, M, N, K, R)
+         cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R] (Y for noise_A)
+@@ -168,8 +181,13 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+         def flush_batch():
+             nonlocal hits
+             if not batch:
+-                return
++                return None
+             cc.sync()
++            newer = pool.check_newer_job(job_id)
++            if newer is not None:
++                bufs.dfound.memset(0)
++                batch.clear()
++                return newer
+             bufs.dfound.to_host(found)
+             if found[:len(batch)].any():
+                 bufs.dcoord.to_host(coord)
+@@ -184,16 +202,24 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+                     # already produced on the GPU by setup_job -> no host transpose.
+                     A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
+                     Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
+-                    proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify))
++                    proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode,
++                                 header, cert_version, verify))
+                     hits += 1
+             bufs.dfound.memset(0)
+             batch.clear()
++            return None
+ 
+         stop = False
+         for r0 in range(0, M, RS):
+             cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
+                           bufs.dApEA, RS, K, R)
+             for c0 in range(0, N, RS):
++                newer = pool.check_newer_job(job_id)
++                if newer is not None:
++                    newer = flush_batch() or newer
++                    log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
++                    sched.note(time.time() - t_acct)
++                    return ("NEWJOB", newer)
+                 if max_regions and searched >= max_regions:
+                     stop = True
+                     break
+@@ -206,10 +232,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+                                    bufs.dcoord.offset(slot * 8), VARIANT)
+                 batch.append((r0, c0))
+                 if len(batch) >= FOUND_BATCH:
+-                    flush_batch()
+-                    # New-job poll + progress log run once per batch (off the per-region
+-                    # hot path) so socket/host work never gates the GPU.
+-                    newer = pool.check_newer_job(job_id)
++                    newer = flush_batch()
+                     if newer is not None:
+                         log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
+                         sched.note(time.time() - t_acct)
+@@ -220,7 +243,11 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
+                         last_print = time.time()
+             if stop:
+                 break
+-        flush_batch()   # drain any partial last batch
++        newer = flush_batch()   # drain any partial last batch
++        if newer is not None:
++            log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
++            sched.note(time.time() - t_acct)
++            return ("NEWJOB", newer)
+ 
+         ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
+         log(f"  grid {grid} done: {hits} hits over {searched} regions ({ths:.2f} TH/s)")
+@@ -279,6 +306,66 @@ def _resolve_pool(args, log):
+     log(f"auto-selected pool {args.pool} (GPU compute_cap {cap})")
+ 
+ 
++def run_benchmark(args, log):
++    """Run the production kernels offline without connecting or submitting."""
++    region = args.region
++    if region < 16 or region % 16 or M % region or N % region:
++        raise ValueError(
++            f"--region must be a multiple of 16 that divides {M}; got {region}")
++    requested = max(1, args.benchmark_regions)
++    available = (M // region) * (N // region)
++    regions = min(requested, available)
++    log(f"offline benchmark | region {region} | regions {regions} | batch {FOUND_BATCH} | no network, no shares")
++
++    bufs = Bufs(region)
++    key = np.arange(32, dtype=np.uint8)
++    bufs.dkeyjob.from_host(key)
++    bufs.dtgt.from_host(np.zeros(32, dtype=np.uint8))
++    cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA,
++                 bufs.dnsB, bufs.dA_root, bufs.dB_root, bufs.dcommit_scratch,
++                 M, N, K, R, 0xB10C4070)
++    cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA,
++                 bufs.dnsB, M, N, K, R)
++    cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)
++    cc.sync()
++
++    launched = 0
++    batch = 0
++    computed: set[int] = set()
++    bufs.dfound.memset(0)
++    started = time.perf_counter()
++    for row_start in range(0, M, region):
++        cc.noise_gemm(bufs.dEAL.offset(row_start * R), bufs.dEAR_t,
++                      bufs.dA.offset(row_start * K), bufs.dApEA,
++                      region, K, R)
++        for col_start in range(0, N, region):
++            block_index = col_start // region
++            if block_index not in computed:
++                cc.noise_gemm(bufs.dEBR.offset(col_start * R), bufs.dEBL,
++                              bufs.dBt_full.offset(col_start * K),
++                              bufs.dBpEB[block_index], region, K, R)
++                computed.add(block_index)
++            cc.pearl_pow_split(
++                bufs.dApEA, bufs.dBpEB[block_index], region, region, K, R,
++                bufs.dnsA, bufs.dtgt, bufs.dtb, None,
++                bufs.dfound.offset(batch * 4), bufs.dcoord.offset(batch * 8), VARIANT)
++            launched += 1
++            batch += 1
++            if batch >= FOUND_BATCH:
++                cc.sync()
++                bufs.dfound.memset(0)
++                batch = 0
++            if launched >= regions:
++                break
++        if launched >= regions:
++            break
++    cc.sync()
++    elapsed = time.perf_counter() - started
++    tiles_per_region = (region // 16) ** 2
++    ths = launched * tiles_per_region * 1048576.0 / max(elapsed, 1e-9) / 1e12
++    log(f"offline benchmark PASS | {launched} regions in {elapsed:.3f}s | {ths:.2f} TH/s")
++
++
+ def run_supervisor(devices, args, log):
+     """Spawn one single-GPU child process per device (pinned via CUDA_VISIBLE_DEVICES),
+     prefix its output with [gpuN], and print a combined-hashrate summary. This is how
+@@ -356,6 +443,10 @@ def main():
+     ap.add_argument("--region", type=int, default=4096)
+     ap.add_argument("--max-regions", type=int, default=0)
+     ap.add_argument("--max-jobs", type=int, default=0)
++    ap.add_argument("--benchmark", action="store_true",
++                    help="run production GPU kernels offline; never connects or submits")
++    ap.add_argument("--benchmark-regions", type=int, default=8,
++                    help="number of regions for --benchmark (default: 8)")
+     ap.add_argument("--devices", default=None,
+                     help="GPU selection: comma-separated indices (e.g. 0,1,2,3) or 'all'. "
+                          "Default: auto-detect and run one worker per GPU.")
+@@ -371,6 +462,10 @@ def main():
+     def log(m):
+         print(f"{time.strftime('%H:%M:%S')} {m}", flush=True)
+ 
++    if args.benchmark:
++        run_benchmark(args, log)
++        return
++
+     # Solo mining to a local node's pearl-gateway (pull protocol, no pool/wallet).
+     if args.solo:
+         run_solo(args, log)
+@@ -429,6 +524,7 @@ def run_single_gpu(args, log):
+     threading.Thread(target=_proof_worker, args=(proof_q, accepted, log),
+                      daemon=True).start()
+     while True:
++        pool = None
+         try:
+             pool = LuckyPool(host, int(port), sched.wallet, args.worker)
+             pool.connect()
+@@ -437,12 +533,12 @@ def run_single_gpu(args, log):
+             job = pool.next_job()
+             status = None
+             while job is not None:
+-                header, target_int, job_id = job
++                header, target_int, job_id, cert_version = job
+                 jobs += 1
+                 # mine_job runs CONTINUOUSLY (fresh grids, no idle) on this job and
+                 # only returns when a newer job arrives or a dev-fee switch is due.
+                 status, val = mine_job(pool, cfg, header, target_int, job_id,
+-                                       args.region, args.max_regions, sched, bufs,
++                                       cert_version, args.region, args.max_regions, sched, bufs,
+                                        accepted, proof_q, log, verify=args.verify)
+                 if args.max_jobs and jobs >= args.max_jobs:
+                     proof_q.join()  # finish submitting in-flight proofs before exit
+@@ -465,6 +561,9 @@ def run_single_gpu(args, log):
+             time.sleep(5)
+         except KeyboardInterrupt:
+             log("stopping"); return
++        finally:
++            if pool is not None:
++                pool.close()
+ 
+ 
+ def run_solo(args, log):
+@@ -513,6 +612,7 @@ def _solo_dev_round(host, port, wallet, worker, cfg, bufs, sched, accepted, proo
+     """Dev-fee round of solo mining: mine LuckyPool with the dev wallet until the
+     scheduler switches back to your node. Reuses the exact pool mining loop."""
+     while sched.mode == "dev":
++        pool = None
+         try:
+             pool = LuckyPool(host, port, wallet, worker)
+             pool.connect()
+@@ -520,8 +620,9 @@ def _solo_dev_round(host, port, wallet, worker, cfg, bufs, sched, accepted, proo
+                 f"(realized {sched.realized_pct():.2f}%)")
+             job = pool.next_job()
+             while job is not None:
+-                header, target_int, job_id = job
+-                status, val = mine_job(pool, cfg, header, target_int, job_id, region,
++                header, target_int, job_id, cert_version = job
++                status, val = mine_job(pool, cfg, header, target_int, job_id,
++                                       cert_version, region,
+                                        max_regions, sched, bufs, accepted, proof_q, log,
+                                        verify=verify)
+                 if status == "NEWJOB":
+@@ -540,6 +641,9 @@ def _solo_dev_round(host, port, wallet, worker, cfg, bufs, sched, accepted, proo
+             time.sleep(5)
+             if sched.maybe_switch():
+                 return
++        finally:
++            if pool is not None:
++                pool.close()
+ 
+ 
+ def _solo_gateway_round(args, cfg, bufs, sched, log):
+@@ -568,6 +672,10 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
+                 job = client.get_mining_info()
+                 header = job.incomplete_header_bytes
+                 target_int = job.target
++                if job.cert_version != 3:
++                    raise RuntimeError(
++                        f"gateway requires certificate version {job.cert_version}; "
++                        "this build only mines V3")
+                 if header != cur_header:
+                     cur_header = header
+                     key = pearl_host.derive_key(header, cfg)
+@@ -581,7 +689,9 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
+                 # ---- fresh random grid (new commitment) for this template ----
+                 bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
+                 cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA,
+-                             bufs.dnsB, M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
++                             bufs.dnsB, bufs.dA_root, bufs.dB_root,
++                             bufs.dcommit_scratch, M, N, K, R,
++                             time.time_ns() & 0xFFFFFFFFFFFFFFFF)
+                 cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR,
+                              bufs.dnsA, bufs.dnsB, M, N, K, R)
+                 cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)
+diff --git a/python/pearl_host.py b/python/pearl_host.py
+index 7aa362f..e71fce9 100644
+--- a/python/pearl_host.py
++++ b/python/pearl_host.py
+@@ -11,6 +11,15 @@ import numpy as np
+ 
+ import pearl_mining as pm
+ 
++SEED_SALT_A = blake3.blake3(b"pearl/cert-v3/noise-seed/A").digest()
++SEED_SALT_B = blake3.blake3(b"pearl/cert-v3/noise-seed/B").digest()
++_BIND_PAD = b"\x00" * 28
++
++
++def _bind_root(merkle_root: bytes, dim: int, salt: bytes) -> bytes:
++    message = merkle_root + dim.to_bytes(4, "little") + _BIND_PAD
++    return blake3.blake3(message, key=salt).digest()
++
+ 
+ def _tree(matrix_i8: np.ndarray):
+     """MerkleTree over the chunk-padded matrix bytes (caller binds the key)."""
+@@ -26,6 +35,8 @@ def commitment_hashes(A: np.ndarray, B: np.ndarray, key: bytes) -> tuple[bytes,
+     """(noise_seed_A, noise_seed_B). A:[m,k] int8, B:[k,n] int8. Commits A and B^T."""
+     root_A = bytes(_merkle_tree(A, key).root)
+     root_B = bytes(_merkle_tree(np.ascontiguousarray(B.T), key).root)
++    root_A = _bind_root(root_A, A.shape[0], SEED_SALT_A)
++    root_B = _bind_root(root_B, B.shape[1], SEED_SALT_B)
+     commitment_B = blake3.blake3(key + root_B).digest()
+     commitment_A = blake3.blake3(commitment_B + root_A).digest()
+     return commitment_A, commitment_B
+@@ -68,11 +79,8 @@ def derive_key(header_bytes: bytes, mining_config) -> bytes:
+     return blake3.blake3(header_bytes + mining_config.to_bytes()).digest()
+ 
+ 
+-def verify_proof_local(header_bytes: bytes, proof, nbits: int | None = None):
++def verify_proof_local(header_bytes: bytes, proof, cert_version: int = 3,
++                       nbits: int | None = None):
+     hdr = pm.IncompleteBlockHeader.from_bytes(header_bytes)
+-    try:
+-        if nbits is not None:
+-            return pm.verify_plain_proof(hdr, proof, nbits)
+-        return pm.verify_plain_proof(hdr, proof)
+-    except TypeError:
+-        return pm.verify_plain_proof(hdr, proof)
++    return pm.verify_plain_proof_for_cert_version(
++        cert_version, hdr, proof, nbits_override=nbits)
+diff --git a/python/pool_common.py b/python/pool_common.py
+index cc4922e..7390dba 100644
+--- a/python/pool_common.py
++++ b/python/pool_common.py
+@@ -5,7 +5,6 @@ miner and the standalone (torch-free) miner.
+ from __future__ import annotations
+ 
+ import json
+-import select
+ import socket
+ import threading
+ import time
+@@ -35,97 +34,147 @@ class LuckyPool:
+     def __init__(self, host, port, wallet, worker):
+         self.host, self.port, self.wallet, self.worker = host, port, wallet, worker
+         self.s = None
+-        self.buf = b""
+         self.difficulty = None
+-        # Serializes socket access between the mining loop (check_newer_job) and the
+-        # background proof-submitter thread.
+-        self.io_lock = threading.Lock()
++        self.send_lock = threading.Lock()
++        self.state = threading.Condition()
++        self._latest_job = None
++        self._job_serial = 0
++        self._delivered_serial = 0
++        self._responses = {}
++        self._pending_ids = set()
++        self._next_request_id = 2
++        self._receiver = None
++        self._stop = threading.Event()
++        self._closed = False
++        self._error = None
+ 
+     def connect(self):
+         self.s = socket.create_connection((self.host, self.port), timeout=30)
+-        self.s.settimeout(60)
++        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
++        self.s.settimeout(1)
++        self._receiver = threading.Thread(target=self._receive_loop, daemon=True)
++        self._receiver.start()
+         self._send("mining.authorize", {"wallet": self.wallet, "worker": self.worker})
+ 
+     def _send(self, method, params, mid=1):
+-        self.s.sendall((json.dumps({"id": mid, "method": method, "params": params}) + "\n").encode())
+-
+-    def _readline(self, timeout):
+-        self.s.settimeout(timeout)
+-        while b"\n" not in self.buf:
+-            try:
+-                d = self.s.recv(65536)
+-            except socket.timeout:
+-                return None
+-            if not d:
+-                return None
+-            self.buf += d
+-        line, self.buf = self.buf.split(b"\n", 1)
+-        return json.loads(line) if line.strip() else None
++        payload = (json.dumps({"id": mid, "method": method, "params": params}) + "\n").encode()
++        with self.send_lock:
++            if self.s is None or self._closed:
++                raise ConnectionError("pool connection is closed")
++            self.s.sendall(payload)
++
++    def _receive_loop(self):
++        buf = b""
++        sock = self.s
++        try:
++            while not self._stop.is_set():
++                try:
++                    data = sock.recv(65536)
++                except socket.timeout:
++                    continue
++                if not data:
++                    raise ConnectionError("pool closed the connection")
++                buf += data
++                while b"\n" in buf:
++                    line, buf = buf.split(b"\n", 1)
++                    if not line.strip():
++                        continue
++                    try:
++                        self._dispatch(json.loads(line))
++                    except (AttributeError, TypeError, ValueError, KeyError):
++                        continue
++        except (ConnectionError, OSError) as exc:
++            if not self._stop.is_set():
++                with self.state:
++                    self._error = exc
++                    self.state.notify_all()
++
++    def _dispatch(self, msg):
++        if msg.get("method") == "mining.notify":
++            params = msg["params"]
++            job = (bytes.fromhex(params["header"]), int(params["target"], 16),
++                   params["job_id"], int(params.get("cert_version", 0)))
++            with self.state:
++                self._latest_job = job
++                self._job_serial += 1
++                self.state.notify_all()
++            return
++        if msg.get("method") == "mining.set_difficulty":
++            with self.state:
++                self.difficulty = msg["params"]
++            print(f"  [pool set_difficulty] {msg['params']}")
++            return
++        mid = msg.get("id")
++        with self.state:
++            if mid in self._pending_ids:
++                self._responses[mid] = msg
++                self.state.notify_all()
++
++    def _raise_if_failed(self):
++        if self._error is not None:
++            raise ConnectionError(str(self._error)) from self._error
++        if self._closed:
++            raise ConnectionError("pool connection is closed")
++
++    def close(self):
++        self._stop.set()
++        with self.send_lock:
++            sock, self.s = self.s, None
++            if sock is not None:
++                try:
++                    sock.shutdown(socket.SHUT_RDWR)
++                except OSError:
++                    pass
++                sock.close()
++        with self.state:
++            self._closed = True
++            self.state.notify_all()
++        if self._receiver is not None and self._receiver is not threading.current_thread():
++            self._receiver.join(timeout=2)
+ 
+     def next_job(self, timeout=70):
+-        end = time.time() + timeout
+-        while time.time() < end:
+-            msg = self._readline(timeout=end - time.time())
+-            if msg is None:
+-                continue
+-            if msg.get("method") == "mining.notify":
+-                p = msg["params"]
+-                return bytes.fromhex(p["header"]), int(p["target"], 16), p["job_id"]
+-            if msg.get("method") == "mining.set_difficulty":
+-                self.difficulty = msg["params"]
+-                print(f"  [pool set_difficulty] {msg['params']}")
+-        return None
++        deadline = time.monotonic() + timeout
++        with self.state:
++            while self._job_serial <= self._delivered_serial:
++                self._raise_if_failed()
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    return None
++                self.state.wait(remaining)
++            self._delivered_serial = self._job_serial
++            return self._latest_job
+ 
+     def check_newer_job(self, current_job_id):
+-        # Non-blocking on the socket lock: if the submitter thread is mid-submit,
+-        # just skip this poll (the GPU keeps running; we catch the new job next time).
+-        if not self.io_lock.acquire(blocking=False):
++        with self.state:
++            self._raise_if_failed()
++            if self._latest_job is not None and self._latest_job[2] != current_job_id:
++                self._delivered_serial = self._job_serial
++                return self._latest_job
+             return None
+-        try:
+-            while True:
+-                r, _, _ = select.select([self.s], [], [], 0)
+-                if not r:
+-                    break
+-                try:
+-                    d = self.s.recv(65536)
+-                except OSError:
+-                    break
+-                if not d:
+-                    break
+-                self.buf += d
+-            newer = None
+-            while b"\n" in self.buf:
+-                line, self.buf = self.buf.split(b"\n", 1)
+-                if not line.strip():
+-                    continue
+-                try:
+-                    msg = json.loads(line)
+-                except ValueError:
+-                    continue
+-                if msg.get("method") == "mining.notify":
+-                    p = msg["params"]
+-                    if p["job_id"] != current_job_id:
+-                        newer = (bytes.fromhex(p["header"]), int(p["target"], 16), p["job_id"])
+-                elif msg.get("method") == "mining.set_difficulty":
+-                    self.difficulty = msg["params"]
+-            return newer
+-        finally:
+-            self.io_lock.release()
+ 
+     def submit(self, job_id, plain_proof_b64):
+-        with self.io_lock:
++        with self.state:
++            mid = self._next_request_id
++            self._next_request_id += 1
++            self._pending_ids.add(mid)
++        try:
+             self._send("mining.submit",
+                        {"wallet": self.wallet, "worker": self.worker,
+-                        "job_id": job_id, "plain_proof": plain_proof_b64}, mid=99)
+-            for _ in range(40):
+-                msg = self._readline(timeout=10)
+-                if msg is None:
+-                    return None
+-                if msg.get("id") == 99:
+-                    return msg
+-                if msg.get("method") == "mining.notify":
+-                    self.buf = (json.dumps(msg) + "\n").encode() + self.buf
+-                    return {"pending_job": True}
++                        "job_id": job_id, "plain_proof": plain_proof_b64}, mid=mid)
++            deadline = time.monotonic() + 10
++            with self.state:
++                while mid not in self._responses:
++                    self._raise_if_failed()
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        return None
++                    self.state.wait(remaining)
++                return self._responses.pop(mid)
++        finally:
++            with self.state:
++                self._pending_ids.discard(mid)
++                self._responses.pop(mid, None)
+ 
+ 
+ class DevFeeScheduler:
+
+diff --git a/python/gateway_client.py b/python/gateway_client.py
+index bbb147d..eaae17e 100644
+--- a/python/gateway_client.py
++++ b/python/gateway_client.py
+@@ -25,6 +25,7 @@ class MinerRpcConfig:
+ class MiningJob:
+     incomplete_header_bytes: bytes
+     target: int
++    cert_version: int
+ 
+     @classmethod
+     def from_dict(cls, data: dict[str, Any]) -> MiningJob:
+@@ -32,6 +33,7 @@ class MiningJob:
+         return cls(
+             incomplete_header_bytes=b64decode(data["incomplete_header_bytes"]),
+             target=data["target"],
++            cert_version=int(data["cert_version"]),
+         )
+ 
+     def to_dict(self) -> dict[str, Any]:
+@@ -39,6 +41,7 @@ class MiningJob:
+         return {
+             "incomplete_header_bytes": b64encode(self.incomplete_header_bytes).decode("ascii"),
+             "target": self.target,
++            "cert_version": self.cert_version,
+         }
+ 
+ 

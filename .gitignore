@@ -1,0 +1,12 @@
+node_modules
+dist
+.DS_Store
+*.local
+*.log
+miner.local
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+diagnostics/**/*.jsonl

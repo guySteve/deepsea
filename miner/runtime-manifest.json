@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "certificateVersion": 3,
+  "cudaToolkit": "12.9.86",
+  "minimumCudaToolkit": "12.4",
+  "cudaTarget": "sm_89",
+  "minimumDriver": "550.0",
+  "devFeePercent": 2,
+  "performanceProfile": {
+    "foundBatch": 16,
+    "tcpNoDelay": true,
+    "preallocatedCommitmentScratch": true
+  },
+  "minerSource": {
+    "repository": "https://github.com/Muskwak/Open-Pearl-Miner.git",
+    "commit": "ac3d992d7eb6ca1bb344d5d3ee125eecb182248d"
+  },
+  "pearlSource": {
+    "repository": "https://github.com/pearl-research-labs/pearl.git",
+    "commit": "d7c517d267f10f5bcbbdc366f3e603942f9a5ab5"
+  },
+  "cutlassSource": {
+    "repository": "https://github.com/NVIDIA/cutlass.git",
+    "commit": "291300ffffa3533a78ee104f08a8490a29ce9ccb"
+  },
+  "sourcePatch": {
+    "path": "patches/open-pearl-miner-v3-sm89.patch",
+    "sha256": "7b24356d0dab1007f0502913719fa2d8e50e929ffb3ed39e508b7ac61dc72db5"
+  },
+  "artifacts": {
+    "app/_dev.py": {
+      "sha256": "489b4c6039e7b7be8f15c7dbd2d067ae7d6ed4ad7fd822318913a30a691b4fdf"
+    },
+    "app/cuda_capi.py": {
+      "sha256": "5ccb7ba0f77fe3ba8f06dce4545f930fd4146419c768a483852715b7c2fcb043"
+    },
+    "app/gateway_client.py": {
+      "sha256": "e4357e67c5cd4d0eab552bb04af90e9ec1c7adb42c89d2f65a858b5d6133da0e"
+    },
+    "app/libp40cuda.so": {
+      "sha256": "d97f752ae6c764a5409ba8c7cab91900645b948c218932704927dfe1a46ed53c"
+    },
+    "app/miner_capi.py": {
+      "sha256": "083a564af428d194d3c9a44f3bef78c35d2c9dcdcff54b4093c89e5995096cec"
+    },
+    "app/pearl_host.py": {
+      "sha256": "18a645d197f6fc635dc0c9c906cdf123ee4a74cf50475f8dda42a5ec51424d07"
+    },
+    "app/pool_common.py": {
+      "sha256": "5ae7dde53ef9406500fe52dd00f0dcf330a975ff082da90db409ae7a83a02de5"
+    },
+    "site/pearl_mining.so": {
+      "sha256": "cece55a6c8f0c27928082a4b93cf0d7b7a02ebd83e3630fe0973f019f33939ad"
+    }
+  },
+  "pythonWheels": [
+    ["blake3", "1.0.11", "33424c686b291c7682b5816fe9320466dbc0a457ef7e15c273c804a2d70fea70"],
+    ["numpy", "2.5.4", "fbde6962867ee75b48b0ee29b2b9372ec5d617799dbaf38e82dc0596f2f7738a"]
+  ],
+  "cudaPackages": [
+    ["cuda-cccl-12-9", "12.9.27-1", "255b92bd5e09cd10aedaf098d1ee0f66ca1a9062efe96e2e1f385583ddf18c73"],
+    ["cuda-crt-12-9", "12.9.86-1", "364c82d5fd53b6687aca004c4583fd119a98e0fe72798d88b0fdedc56ad5aecf"],
+    ["cuda-cudart-12-9", "12.9.79-1", "2649df5457dcf9a741f979b5c71e09aba563a11ef1c84a0725c3fe7a37625e6e"],
+    ["cuda-cudart-dev-12-9", "12.9.79-1", "e3ca8561b6bec2a92928ebafd68ed9278bf66d5521a2584d6370792386b247c0"],
+    ["cuda-driver-dev-12-9", "12.9.79-1", "5fece9ec181860350dbda0e6368cee79797c6f00f9a44f376d241a1889e5608b"],
+    ["cuda-nvcc-12-9", "12.9.86-1", "66c11ad4fba8c12c44a1fec346c5125011e2ed519b98a787966dda0df9043b45"],
+    ["cuda-nvvm-12-9", "12.9.86-1", "679b7fa53d30dcb7d2f5f55107274fa502ff18071c6c1235cb941fcbe22a1403"]
+  ]
+}

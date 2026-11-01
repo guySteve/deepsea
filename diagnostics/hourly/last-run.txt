@@ -1,0 +1,3 @@
+Pearl remains stopped: zero logged grids this hour. No restart or tuning changes made. CPU checks passed; readiness probes were sandbox-blocked. Telemetry still reports a 200 W idle limit; saved mining caps remain ≤160 W.
+
+Updated the [report](/mnt/c/Users/smmoh/OneDrive/Desktop/deepsea/diagnostics/hourly/review-20261101-001534.md), latest report, and memory.
